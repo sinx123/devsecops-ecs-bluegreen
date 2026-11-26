@@ -1,0 +1,2 @@
+github_org       = "sinx123"
+sbom_bucket_name = "your-unique-name-devsecops-sboms"

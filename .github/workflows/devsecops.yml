@@ -1,0 +1,168 @@
+name: devsecops-pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ---------- Gate 1: secrets ----------
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------- Gate 2: code quality + SAST ----------
+  test-and-sast:
+    name: Unit tests, Bandit, SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r app/requirements-dev.txt
+      - name: Unit tests with coverage
+        run: pytest app --cov=app --cov-report=xml:coverage.xml
+      - name: Bandit (Python SAST, fails on high severity)
+        run: bandit -r app/app.py -lll
+      - name: SonarCloud scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_HOST_URL: https://sonarcloud.io
+
+  # ---------- Gate 3: infrastructure as code ----------
+  iac-scan:
+    name: IaC scan (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          # Set repo variable CHECKOV_SOFT_FAIL=true while you tune findings, then remove it to enforce.
+          soft_fail: ${{ vars.CHECKOV_SOFT_FAIL == 'true' }}
+
+  # ---------- Gate 4: filesystem / dependency scan ----------
+  dependency-scan:
+    name: Dependency scan (Trivy fs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: app
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ---------- Build, scan image, SBOM, sign, deploy (main only) ----------
+  build-and-deploy:
+    name: Build, scan, sign, blue/green deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [secret-scan, test-and-sast, iac-scan, dependency-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # AWS OIDC + Cosign keyless signing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image name
+        run: |
+          echo "IMAGE=${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+          build-args: APP_VERSION=${{ github.sha }}
+
+      - name: Container scan (Trivy) - fail on CRITICAL/HIGH
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+
+      - name: Store SBOM in S3
+        run: aws s3 cp sbom.spdx.json s3://${{ vars.SBOM_BUCKET }}/${{ vars.ECR_REPOSITORY }}/${GITHUB_SHA::8}/sbom.spdx.json
+
+      - name: Push image
+        id: push
+        run: |
+          docker push "$IMAGE"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, GitHub OIDC identity)
+        run: cosign sign --yes "${{ steps.push.outputs.digest }}"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ vars.ECS_TASK_FAMILY }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition with the signed image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: app
+          image: ${{ env.IMAGE }}
+          environment-variables: |
+            APP_VERSION=${{ github.sha }}
+
+      - name: Blue/green deploy through CodeDeploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          codedeploy-appspec: ecs/appspec.yaml
+          codedeploy-application: ${{ vars.CODEDEPLOY_APP }}
+          codedeploy-deployment-group: ${{ vars.CODEDEPLOY_DG }}
+          wait-for-service-stability: true

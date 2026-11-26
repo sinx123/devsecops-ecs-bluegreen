@@ -1,0 +1,6 @@
+title = "gitleaks config"
+[extend]
+useDefault = true
+[allowlist]
+description = "Documentation placeholders"
+paths = ['''README\.md''', '''docs/.*''']
