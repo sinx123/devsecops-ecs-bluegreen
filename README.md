@@ -123,3 +123,18 @@ cd terraform && terraform destroy
 ## Resume bullet
 
 > Built a DevSecOps CI/CD pipeline integrating secret, SAST, IaC, dependency and container scanning with SBOM generation and keyless Cosign image signing; deployed via CodeDeploy blue/green canary releases on ECS Fargate with CloudWatch-alarm-driven automatic rollback.
+
+
+## Planned pipeline design
+> Design diagram only. Deployment screenshots will be added later.
+
+```mermaid
+flowchart TD
+    A[Code push] --> B[Gitleaks: secret scan]
+    B --> C[Trivy: vulnerability scan]
+    C --> D[Build image, SBOM and Cosign signature]
+    D --> E[CodeDeploy: blue/green on ECS]
+    E --> F[10% canary traffic]
+    F -->|Healthy| G[Shift all traffic]
+    F -->|5xx alarm| H[Automatic rollback]
+```
